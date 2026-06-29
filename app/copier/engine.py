@@ -28,6 +28,7 @@ from sqlalchemy import or_, select
 
 from app.config import Settings, get_settings
 from app.copier import risk as risk_mgr
+from app.polymarket import geoblock as _geoblock
 from app.copier.executor import Executor, FillResult, PaperExecutor
 from app.copier.exits import evaluate_exits
 from app.copier.kelly import kelly_size
@@ -95,6 +96,18 @@ class CopyEngine:
             if not settings.live_trading and not state.paper_initialized:
                 state.paper_cash_usd = settings.paper_bankroll
                 state.paper_initialized = True
+
+            # Geoblock check — halt immediately if this IP is blocked.
+            if settings.live_trading:
+                geo = _geoblock.check()
+                if geo.blocked:
+                    state.live_ready = False
+                    state.live_reason = geo.reason
+                    state.last_run_at = dt.datetime.now(dt.timezone.utc)
+                    state.last_run_status = f"GEOBLOCKED ({geo.country}/{geo.region})"
+                    state.runs_total += 1
+                    log.error("halting cycle: %s", geo.reason)
+                    return report
 
             # Update live-readiness banner.
             if settings.live_trading:

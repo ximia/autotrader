@@ -15,6 +15,7 @@ from sqlalchemy import desc, func, select
 
 from app import pnl
 from app.config import get_settings
+from app.polymarket import geoblock as _geoblock
 from app.db import get_state, init_db, session_scope
 from app.models import (
     BotState, CopyTrade, PnLSnapshot, Position, SignalEvent, Trader,
@@ -67,6 +68,8 @@ def api_status() -> dict:
         if job and job.next_run_time:
             next_run = job.next_run_time.isoformat()
 
+    geo = _geoblock.check() if settings.live_trading else None
+
     with session_scope() as s:
         state = get_state(s)
         return {
@@ -74,6 +77,13 @@ def api_status() -> dict:
             "demo_mode": settings.demo_mode,
             "paused": state.paused,
             "circuit_breaker_active": state.circuit_breaker_active,
+            "geoblock": {
+                "blocked": geo.blocked if geo else False,
+                "country": geo.country if geo else "",
+                "region": geo.region if geo else "",
+                "ip": geo.ip if geo else "",
+                "reason": geo.reason if geo else "",
+            } if geo else None,
             "last_run_at": state.last_run_at.isoformat() if state.last_run_at else None,
             "last_run_status": state.last_run_status,
             "runs_total": state.runs_total,

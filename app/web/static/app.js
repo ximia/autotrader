@@ -182,6 +182,19 @@ function renderStatus(s, sum) {
   $("btn-pause").style.display  = s.paused ? "none" : "";
   $("btn-resume").style.display = s.paused ? "" : "none";
 
+  // Geoblock banner — shown when this server's IP is blocked.
+  const geoBanner = $("geo-banner");
+  if (s.geoblock && s.geoblock.blocked) {
+    geoBanner.style.display = "";
+    geoBanner.className = "banner banner-err";
+    geoBanner.textContent =
+      `🚫 GEOBLOCKED — this server's IP (${s.geoblock.ip}) is in a restricted region ` +
+      `(${s.geoblock.country}/${s.geoblock.region}). ` +
+      `Move the bot to an allowed server (Ireland, Finland, Canada BC, etc.) to trade.`;
+  } else {
+    geoBanner.style.display = "none";
+  }
+
   // Live readiness banner.
   const banner = $("live-banner");
   if (s.live_trading) {
