@@ -1,0 +1,654 @@
+"""Copy engine — consensus-driven, risk-managed trade execution.
+
+Architecture:
+  1. Paused / paper-init / risk-baseline setup.
+  2. Leaderboard refresh (rate-limited).
+  3. Parallel fetch of recent fills from ALL tracked traders.
+  4. Composite trader scoring (ranking module).
+  5. Protective exits (TP / SL / trailing / mirror).
+  6. Consensus signal detection (signal engine).
+  7. Per-signal: risk checks → Kelly sizing → execution → DB writes.
+  8. Update run stats.
+
+The key design shift from naive copy-trading: trades are only executed
+when multiple top traders independently enter the same market/outcome
+AND the composite confidence score clears a configurable threshold.
+This trades volume for quality.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+from sqlalchemy import select
+
+from app.config import Settings, get_settings
+from app.copier import risk as risk_mgr
+from app.copier.executor import Executor, FillResult, PaperExecutor
+from app.copier.exits import evaluate_exits
+from app.copier.kelly import kelly_size
+from app.copier.market_filter import check_market, check_slippage
+from app.copier.ranking import LeaderboardTrader, score_all
+from app.copier.signal_engine import Signal, SignalEngine
+from app.db import get_state, reset_daily_spend_if_needed, session_scope
+from app.models import BotState, CopyTrade, Position, SignalEvent, Trader, TraderScoreHistory
+from app.polymarket.data_client import DataClient, SourceTrade
+from app.polymarket.gamma_client import GammaClient
+
+log = logging.getLogger(__name__)
+
+_signal_engine = SignalEngine()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RunReport:
+    started_at: dt.datetime
+    signals_evaluated: int = 0
+    signals_executed: int = 0
+    signals_skipped: int = 0
+    trades_seen: int = 0
+    skipped_reasons: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (
+            f"signals={self.signals_evaluated} "
+            f"executed={self.signals_executed} "
+            f"skipped={self.signals_skipped}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COPY ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CopyEngine:
+    def __init__(self, *, data: DataClient, gamma: GammaClient, executor: Executor, settings: Settings | None = None):
+        self.data = data
+        self.gamma = gamma
+        self.executor = executor
+        self.settings = settings or get_settings()
+
+    # ── MAIN LOOP ────────────────────────────────────────────────────────────
+
+    def run_once(self) -> RunReport:
+        report = RunReport(started_at=dt.datetime.now(dt.timezone.utc))
+        settings = self.settings
+
+        # ── setup / guard checks ──────────────────────────────────────────
+        with session_scope() as s:
+            state = get_state(s)
+            reset_daily_spend_if_needed(state)
+
+            if state.paused:
+                log.info("bot is paused — skipping cycle")
+                return report
+
+            # Paper bankroll initialization.
+            if not settings.live_trading and not state.paper_initialized:
+                state.paper_cash_usd = settings.paper_bankroll
+                state.paper_initialized = True
+
+            # Update live-readiness banner.
+            if settings.live_trading:
+                ok, reason = self.executor.readiness()
+                state.live_ready = ok
+                state.live_reason = reason
+                if ok:
+                    state.usdc_available = self.executor.available_cash()
+
+            # Compute current equity for risk baselines.
+            # Read from the in-session state rather than opening a new session
+            # (outer session hasn't committed yet, so a nested session would
+            # return stale data for paper_cash_usd).
+            if settings.live_trading:
+                try:
+                    _equity = self.executor.available_cash()
+                except Exception:
+                    _equity = state.paper_cash_usd
+            else:
+                _equity = state.paper_cash_usd
+            risk_mgr.update_equity_baselines(state, _equity)
+
+        # ── leaderboard refresh ───────────────────────────────────────────
+        wallets, trader_scores = self._maybe_refresh_leaderboard(settings)
+
+        if not wallets:
+            log.warning("no tracked traders — skipping cycle")
+            return report
+
+        # ── parallel fetch of recent fills ────────────────────────────────
+        now_ts = int(time.time())
+        signal_window_ts = now_ts - int(settings.signal_window_min * 60)
+
+        # Per-trader cursors: only feed fills newer than cursor to the signal
+        # engine so we don't re-fire signals on stale data.
+        cursor_by_wallet: dict[str, int] = {}
+        with session_scope() as s:
+            for wallet in wallets:
+                t = s.get(Trader, wallet)
+                cursor_by_wallet[wallet] = t.last_seen_ts if t else 0
+
+        # Use the most conservative lookback: max(signal_window_ts, cursor).
+        # On first sight (cursor=0), respect initial_lookback_min.
+        fills_by_wallet: dict[str, list[SourceTrade]] = {}
+        for wallet in wallets:
+            cursor = cursor_by_wallet[wallet]
+            if cursor == 0:
+                if settings.initial_lookback_min <= 0:
+                    # On first run with no lookback: advance cursor to now, skip fills.
+                    with session_scope() as s:
+                        t = s.get(Trader, wallet)
+                        if t:
+                            t.last_seen_ts = now_ts
+                    fills_by_wallet[wallet] = []
+                    continue
+                else:
+                    since = now_ts - int(settings.initial_lookback_min * 60)
+            else:
+                since = max(cursor, signal_window_ts)
+
+            fills_by_wallet[wallet] = []  # populated by parallel fetch below
+
+        # Wallets that need fetching (cursor already advanced for the rest).
+        wallets_to_fetch = [w for w in wallets if w not in fills_by_wallet or fills_by_wallet[w] == []]
+        # Distinguish between "skip (cursor=0, no lookback)" and "actually fetch".
+        wallets_to_fetch = [
+            w for w in wallets
+            if not (cursor_by_wallet[w] == 0 and settings.initial_lookback_min <= 0)
+        ]
+
+        if wallets_to_fetch:
+            raw = self.data.fetch_all_trades(wallets_to_fetch, limit=50, since_ts=signal_window_ts)
+            for wallet, fills in raw.items():
+                cursor = cursor_by_wallet[wallet]
+                fills_by_wallet[wallet] = [f for f in fills if f.timestamp > cursor]
+                report.trades_seen += len(fills_by_wallet[wallet])
+
+        # ── advance per-trader cursors ─────────────────────────────────────
+        for wallet, fills in fills_by_wallet.items():
+            if fills:
+                max_ts = max(f.timestamp for f in fills)
+                with session_scope() as s:
+                    t = s.get(Trader, wallet)
+                    if t and max_ts > t.last_seen_ts:
+                        t.last_seen_ts = max_ts
+
+        # ── protective exits ──────────────────────────────────────────────
+        if settings.enable_auto_exits or settings.mirror_exits:
+            trader_sold = {
+                f.token_id
+                for fills in fills_by_wallet.values()
+                for f in fills
+                if f.side == "SELL"
+            }
+            self._process_exits(trader_sold, settings)
+
+        # ── consensus signal generation ───────────────────────────────────
+        # Filter to BUY fills for signal detection.
+        if settings.copy_buys_only:
+            buy_fills = {w: [f for f in fills if f.side == "BUY"] for w, fills in fills_by_wallet.items()}
+        else:
+            buy_fills = fills_by_wallet
+
+        signals = _signal_engine.generate_signals(
+            buy_fills,
+            trader_scores,
+            market_info_fn=lambda tid: self.gamma.market_for_token(tid, use_cache=True),
+            min_consensus=settings.min_consensus_count,
+            min_confidence=settings.min_signal_confidence,
+        )
+
+        report.signals_evaluated = len(signals)
+
+        # ── per-signal: risk check → Kelly → execute ──────────────────────
+        bankroll = self._bankroll()
+        for sig in signals:
+            executed = self._execute_signal(sig, bankroll, report, settings)
+            if executed:
+                bankroll = self._bankroll()  # refresh after each spend
+
+        # ── update run stats ──────────────────────────────────────────────
+        with session_scope() as s:
+            state = get_state(s)
+            state.last_run_at = dt.datetime.now(dt.timezone.utc)
+            state.last_run_status = report.summary()
+            state.runs_total += 1
+
+        return report
+
+    # ── LEADERBOARD REFRESH ──────────────────────────────────────────────────
+
+    def _maybe_refresh_leaderboard(self, settings: Settings) -> tuple[list[str], dict[str, float]]:
+        """Return (wallet_list, trader_scores) refreshing DB if due."""
+        with session_scope() as s:
+            state = get_state(s)
+            last = state.leaderboard_refreshed_at
+            now = dt.datetime.now(dt.timezone.utc)
+            if last is not None:
+                last_utc = last.replace(tzinfo=dt.timezone.utc) if last.tzinfo is None else last
+                if (now - last_utc).total_seconds() < settings.leaderboard_refresh_min * 60:
+                    # Return cached wallets + scores from DB.
+                    wallets = list(
+                        s.scalars(
+                            select(Trader.wallet)
+                            .where(Trader.tracked.is_(True))
+                            .order_by(Trader.rank)
+                        )
+                    )
+                    scores = {
+                        t.wallet: t.composite_score
+                        for t in s.scalars(select(Trader).where(Trader.tracked.is_(True))).all()
+                    }
+                    return wallets, scores
+
+        return self._refresh_leaderboard(settings)
+
+    def _refresh_leaderboard(self, settings: Settings) -> tuple[list[str], dict[str, float]]:
+        board = self.data.leaderboard(
+            window=settings.leaderboard_window,
+            category=settings.leaderboard_category,
+            limit=settings.top_n,
+        )
+        if not board:
+            log.warning("leaderboard returned empty; retaining current traders")
+            with session_scope() as s:
+                wallets = list(
+                    s.scalars(select(Trader.wallet).where(Trader.tracked.is_(True)).order_by(Trader.rank))
+                )
+                scores = {
+                    t.wallet: t.composite_score
+                    for t in s.scalars(select(Trader).where(Trader.tracked.is_(True))).all()
+                }
+            return wallets, scores
+
+        # Score traders using recent fills (parallel fetch).
+        fill_wallets = [lt.wallet for lt in board]
+        fills_by_wallet = self.data.fetch_all_trades(fill_wallets, limit=50, since_ts=0)
+        trader_scores_obj = score_all(board, fills_by_wallet)
+        scores_map: dict[str, float] = {s.wallet: s.composite for s in trader_scores_obj}
+
+        with session_scope() as s:
+            state = get_state(s)
+            # Un-track all.
+            for t in s.scalars(select(Trader).where(Trader.tracked.is_(True))).all():
+                t.tracked = False
+
+            for lt in board:
+                score = scores_map.get(lt.wallet, 0.0)
+                ts_obj = next((x for x in trader_scores_obj if x.wallet == lt.wallet), None)
+
+                t = s.get(Trader, lt.wallet)
+                if t is None:
+                    t = Trader(wallet=lt.wallet, last_seen_ts=0)
+                    s.add(t)
+                t.username = lt.username
+                t.rank = lt.rank
+                t.pnl = lt.pnl
+                t.volume = lt.volume
+                t.composite_score = score
+                t.roi_estimate = ts_obj.roi_estimate if ts_obj else 0.0
+                t.win_rate_proxy = ts_obj.win_rate_proxy if ts_obj else 0.0
+                t.sharpe_proxy = ts_obj.sharpe_proxy if ts_obj else 0.0
+                t.trade_count = ts_obj.activity if ts_obj else 0
+                t.tracked = True
+                t.last_scored_at = dt.datetime.now(dt.timezone.utc)
+
+                if ts_obj:
+                    s.add(TraderScoreHistory(
+                        wallet=lt.wallet,
+                        composite_score=ts_obj.composite,
+                        roi_estimate=ts_obj.roi_estimate,
+                        win_rate_proxy=ts_obj.win_rate_proxy,
+                        sharpe_proxy=ts_obj.sharpe_proxy,
+                        conviction_score=ts_obj.conviction,
+                        recency_score=ts_obj.recency,
+                    ))
+
+            # Always track allowlisted wallets.
+            for addr in settings.allowlist:
+                t = s.get(Trader, addr.lower())
+                if t is None:
+                    t = Trader(wallet=addr.lower(), last_seen_ts=0)
+                    s.add(t)
+                t.tracked = True
+
+            state.leaderboard_refreshed_at = dt.datetime.now(dt.timezone.utc)
+            wallets = [lt.wallet for lt in board] + settings.allowlist
+
+        log.info("leaderboard refreshed: %d traders, scores=%s",
+                 len(board),
+                 {w[:8]: round(v, 2) for w, v in list(scores_map.items())[:5]})
+
+        return list(dict.fromkeys(wallets)), scores_map  # deduplicated
+
+    # ── EXITS ────────────────────────────────────────────────────────────────
+
+    def _process_exits(self, trader_sold: set[str], settings: Settings) -> None:
+        with session_scope() as s:
+            open_positions = list(
+                s.scalars(select(Position).where(Position.closed.is_(False)))
+            )
+
+        decisions = evaluate_exits(
+            open_positions,
+            price_fn=self._current_price,
+            take_profit_pct=settings.take_profit_pct,
+            stop_loss_pct=settings.stop_loss_pct,
+            trailing_stop_pct=settings.trailing_stop_pct,
+            break_even_stop=settings.break_even_stop,
+            enable_tp_sl=settings.enable_auto_exits,
+            mirror_exits=settings.mirror_exits,
+            trader_sold_tokens=trader_sold,
+        )
+
+        for d in decisions:
+            result = self.executor.sell(d.token_id, d.shares, d.cur_price)
+            with session_scope() as s:
+                pos = s.get(Position, d.token_id)
+                if not pos or pos.shares <= 0:
+                    continue
+
+                ratio = min(d.shares / pos.shares, 1.0)
+                proceeds = result.usd
+                cost_sold = pos.cost_basis_usd * ratio
+                pnl = proceeds - cost_sold
+
+                pos.realized_pnl_usd += pnl
+                pos.cost_basis_usd = max(pos.cost_basis_usd - cost_sold, 0.0)
+                pos.shares = max(pos.shares - d.shares, 0.0)
+                if pos.shares <= 0.001:
+                    pos.shares = 0.0
+                    pos.closed = True
+
+                if not settings.live_trading:
+                    get_state(s).paper_cash_usd += proceeds
+
+                # Update risk counters.
+                state = get_state(s)
+                risk_mgr.record_fill_outcome(pnl >= 0, settings, state)
+
+                # Record the exit CopyTrade.
+                orig = s.scalars(
+                    select(CopyTrade)
+                    .where(CopyTrade.token_id == d.token_id, CopyTrade.side == "BUY")
+                    .order_by(CopyTrade.created_at)
+                    .limit(1)
+                ).first()
+                if orig:
+                    uid = f"exit:{d.token_id}:{int(time.time()*1000)}"
+                    s.add(CopyTrade(
+                        source_trade_id=uid,
+                        trader_wallet=orig.trader_wallet,
+                        token_id=d.token_id,
+                        condition_id=pos.condition_id,
+                        market_question=pos.market_question,
+                        outcome=pos.outcome,
+                        side="SELL",
+                        source_price=d.cur_price,
+                        source_size_usd=result.usd,
+                        our_usd=result.usd,
+                        our_shares=d.shares,
+                        fill_price=result.fill_price,
+                        status=result.status,
+                        skip_reason=f"auto-exit: {d.reason}",
+                        slippage_pct=result.slippage_pct,
+                        execution_latency_ms=result.latency_ms,
+                        is_live=result.is_live,
+                    ))
+
+            log.info("exit %s %.2f @ %.3f (%s) → pnl=%.2f",
+                     d.token_id[:12], d.shares, d.cur_price, d.reason,
+                     result.usd - (d.shares * d.cur_price))
+
+    # ── SIGNAL EXECUTION ─────────────────────────────────────────────────────
+
+    def _execute_signal(
+        self,
+        sig: Signal,
+        bankroll: float,
+        report: RunReport,
+        settings: Settings,
+    ) -> bool:
+        """Execute a single consensus signal through full risk + sizing checks."""
+
+        # Check signal cooldown (same token within cooldown window).
+        if settings.signal_cooldown_min > 0:
+            cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=settings.signal_cooldown_min)
+            with session_scope() as s:
+                recent = s.scalars(
+                    select(SignalEvent)
+                    .where(
+                        SignalEvent.token_id == sig.token_id,
+                        SignalEvent.side == sig.side,
+                        SignalEvent.executed.is_(True),
+                        SignalEvent.ts >= cutoff,
+                    )
+                    .limit(1)
+                ).first()
+            if recent:
+                self._record_signal(sig, executed=False, skip_reason="signal_cooldown")
+                report.signals_skipped += 1
+                report.skipped_reasons.append("cooldown")
+                return False
+
+        # Blocklist check.
+        if any(w in settings.blocklist for w in sig.participating_wallets):
+            self._record_signal(sig, executed=False, skip_reason="blocklisted_trader")
+            report.signals_skipped += 1
+            return False
+
+        # Market quality check.
+        market = self.gamma.market_for_token(sig.token_id, use_cache=True)
+        cur_price = self._current_price(sig.token_id) or sig.avg_price
+        ok, reason = check_market(market, cur_price, settings)
+        if not ok:
+            self._record_signal(sig, executed=False, skip_reason=reason)
+            report.signals_skipped += 1
+            report.skipped_reasons.append(reason)
+            return False
+
+        # Slippage check (current price vs source traders' average fill).
+        ok, reason = check_slippage(sig.avg_price, cur_price, settings.max_slippage_pct)
+        if not ok:
+            self._record_signal(sig, executed=False, skip_reason=reason)
+            report.signals_skipped += 1
+            report.skipped_reasons.append(reason)
+            return False
+
+        # Kelly sizing.
+        kelly = kelly_size(
+            signal_confidence=sig.confidence,
+            market_price=cur_price,
+            bankroll=bankroll,
+            kelly_fraction=settings.kelly_fraction,
+            max_kelly_bet_pct=settings.max_kelly_bet_pct,
+            min_order_usd=settings.min_order_usd,
+            max_per_trade_usd=settings.max_per_trade_usd,
+        )
+        if not kelly.accepted:
+            self._record_signal(sig, executed=False, skip_reason=f"kelly:{kelly.reason}")
+            report.signals_skipped += 1
+            report.skipped_reasons.append("kelly")
+            return False
+
+        usd = kelly.usd
+
+        # Apply copy_ratio scaling.
+        usd = round(usd * settings.copy_ratio, 2)
+        usd = max(min(usd, settings.max_per_trade_usd), settings.min_order_usd)
+
+        # Risk management checks.
+        primary_trader = sig.participating_wallets[0] if sig.participating_wallets else "unknown"
+        ok, reason = risk_mgr.check_all(settings, bankroll, sig.token_id, primary_trader, usd)
+        if not ok:
+            self._record_signal(sig, executed=False, skip_reason=reason)
+            report.signals_skipped += 1
+            report.skipped_reasons.append(reason)
+            return False
+
+        # Cash clamp — never spend more than we have.
+        available = self.executor.available_cash()
+        usd = min(usd, available)
+        if usd < settings.min_order_usd:
+            self._record_signal(sig, executed=False, skip_reason="insufficient_cash")
+            report.signals_skipped += 1
+            report.skipped_reasons.append("no_cash")
+            return False
+
+        # ── execute ───────────────────────────────────────────────────────
+        t0 = time.monotonic()
+        result = self.executor.buy(sig.token_id, usd, cur_price)
+        total_latency_ms = round((time.monotonic() - t0) * 1000, 2)
+
+        slippage = (result.fill_price - cur_price) / cur_price if cur_price > 0 else 0.0
+        reasons_json = json.dumps(sig.reasons)
+
+        if result.status in ("filled", "submitted"):
+            with session_scope() as s:
+                state = get_state(s)
+                if not settings.live_trading:
+                    state.paper_cash_usd = max(state.paper_cash_usd - result.usd, 0.0)
+                state.spent_today_usd += result.usd
+
+                # Upsert position.
+                pos = s.get(Position, sig.token_id)
+                if pos is None:
+                    pos = Position(
+                        token_id=sig.token_id,
+                        condition_id=sig.condition_id,
+                        market_question=sig.market_question,
+                        outcome=sig.outcome,
+                        shares=0.0, avg_price=0.0,
+                        cost_basis_usd=0.0, realized_pnl_usd=0.0,
+                        cur_price=0.0, peak_price=0.0, closed=False,
+                    )
+                    s.add(pos)
+                old_shares = pos.shares or 0.0
+                total_shares = old_shares + result.shares
+                if total_shares > 0:
+                    pos.avg_price = (
+                        (pos.avg_price or 0.0) * old_shares
+                        + result.fill_price * result.shares
+                    ) / total_shares
+                pos.shares = total_shares
+                pos.cost_basis_usd = (pos.cost_basis_usd or 0.0) + result.usd
+                pos.cur_price = result.fill_price
+                pos.peak_price = max(pos.peak_price or 0.0, result.fill_price)
+                pos.closed = False
+
+                # Record one CopyTrade per participating trader (ties fills to traders).
+                for wallet in sig.participating_wallets:
+                    source_id = f"sig:{sig.token_id}:{wallet}:{int(time.time())}"
+                    # Check if already exists (shouldn't, but be safe).
+                    if s.scalars(
+                        select(CopyTrade).where(CopyTrade.source_trade_id == source_id).limit(1)
+                    ).first():
+                        continue
+                    s.add(CopyTrade(
+                        source_trade_id=source_id,
+                        trader_wallet=wallet,
+                        token_id=sig.token_id,
+                        condition_id=sig.condition_id,
+                        market_question=sig.market_question,
+                        outcome=sig.outcome,
+                        side=sig.side,
+                        source_price=sig.avg_price,
+                        source_size_usd=sig.total_source_usd / max(len(sig.participating_wallets), 1),
+                        our_usd=result.usd / max(len(sig.participating_wallets), 1),
+                        our_shares=result.shares / max(len(sig.participating_wallets), 1),
+                        fill_price=result.fill_price,
+                        status=result.status,
+                        order_id=result.order_id,
+                        confidence_score=sig.confidence,
+                        consensus_count=sig.consensus_count,
+                        slippage_pct=round(slippage, 4),
+                        execution_latency_ms=total_latency_ms,
+                        signal_reasons=reasons_json,
+                        is_live=result.is_live,
+                    ))
+
+            self._record_signal(sig, executed=True, usd=result.usd, fill_price=result.fill_price)
+            report.signals_executed += 1
+
+            log.info(
+                "SIGNAL EXECUTED: %s %s consensus=%d conf=%.2f usd=%.2f @ %.3f "
+                "kelly_f=%.4f edge=%.3f lat=%.1fms",
+                sig.side, sig.token_id[:16], sig.consensus_count, sig.confidence,
+                result.usd, result.fill_price,
+                kelly.kelly_f, kelly.edge_pct, total_latency_ms,
+            )
+            return True
+        else:
+            self._record_signal(sig, executed=False, skip_reason=f"exec:{result.status} {result.error or ''}")
+            report.signals_skipped += 1
+            return False
+
+    # ── HELPERS ──────────────────────────────────────────────────────────────
+
+    def _bankroll(self) -> float:
+        if self.executor.is_live:
+            return float(self.executor.available_cash())
+        with session_scope() as s:
+            return get_state(s).paper_cash_usd
+
+    def _current_price(self, token_id: str) -> Optional[float]:
+        info = self.gamma.market_for_token(token_id, use_cache=True)
+        return info.mid_price if info else None
+
+    def _record_signal(
+        self,
+        sig: Signal,
+        *,
+        executed: bool,
+        skip_reason: Optional[str] = None,
+        usd: float = 0.0,
+        fill_price: Optional[float] = None,
+    ) -> None:
+        with session_scope() as s:
+            s.add(SignalEvent(
+                token_id=sig.token_id,
+                market_question=sig.market_question,
+                outcome=sig.outcome,
+                side=sig.side,
+                consensus_count=sig.consensus_count,
+                confidence=sig.confidence,
+                participating_wallets=json.dumps(sig.participating_wallets),
+                executed=executed,
+                skip_reason=skip_reason,
+                usd_executed=usd,
+                fill_price=fill_price,
+            ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FACTORY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_default_engine() -> CopyEngine:
+    """Construct a CopyEngine using the active settings."""
+    settings = get_settings()
+
+    if settings.demo_mode:
+        from app.polymarket.demo import DemoData, DemoGamma
+        data = DemoData()   # type: ignore[assignment]
+        gamma = DemoGamma() # type: ignore[assignment]
+    else:
+        data = DataClient()
+        gamma = GammaClient()
+
+    if not settings.demo_mode and settings.live_trading and settings.private_key:
+        from app.polymarket.clob_client import ClobTrader
+        from app.copier.executor import LiveExecutor
+        executor: Executor = LiveExecutor(ClobTrader())
+    else:
+        executor = PaperExecutor()
+
+    return CopyEngine(data=data, gamma=gamma, executor=executor, settings=settings)

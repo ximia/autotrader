@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket Copy-Trader</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>📈 Polymarket Copy-Trader</h1>
+    <div id="mode-badge" class="badge badge-paper">PAPER</div>
+    <div id="cb-badge" class="badge badge-warn" style="display:none">⚡ CIRCUIT BREAKER</div>
+    <div id="health-dot" class="health-dot" title="Scheduler health"></div>
+  </header>
+
+  <div id="live-banner" class="banner" style="display:none"></div>
+  <div id="risk-banner" class="banner" style="display:none"></div>
+
+  <!-- STATS BAR -->
+  <section class="statusbar">
+    <div class="stat"><span class="label">Bankroll</span><span id="s-bankroll" class="value">—</span></div>
+    <div class="stat"><span class="label">Total PnL</span><span id="s-pnl" class="value">—</span></div>
+    <div class="stat"><span class="label">Unrealized</span><span id="s-upnl" class="value">—</span></div>
+    <div class="stat"><span class="label">Win rate</span><span id="s-winrate" class="value">—</span></div>
+    <div class="stat"><span class="label">Open pos.</span><span id="s-open" class="value">—</span></div>
+    <div class="stat"><span class="label">Spent today</span><span id="s-spent" class="value">—</span></div>
+    <div class="stat"><span class="label">Loop</span><span id="s-loop" class="value">—</span></div>
+    <div class="stat"><span class="label">Next run</span><span id="s-next" class="value">—</span></div>
+    <div class="stat"><span class="label">Signals fired</span><span id="s-signals" class="value">—</span></div>
+    <div class="stat"><span class="label">Losses streak</span><span id="s-losses" class="value">—</span></div>
+  </section>
+
+  <!-- CONTROLS -->
+  <section class="controls">
+    <button id="btn-run" class="btn">▶ Run now</button>
+    <button id="btn-pause" class="btn btn-warn">⏸ Pause</button>
+    <button id="btn-resume" class="btn btn-ok" style="display:none">▶ Resume</button>
+    <button id="btn-reset-cb" class="btn btn-warn" style="display:none">⚡ Reset breaker</button>
+    <span id="live-note" class="note"></span>
+  </section>
+
+  <!-- EQUITY CURVE -->
+  <section class="card">
+    <div class="card-header">
+      <h2>Equity curve</h2>
+      <div class="chart-legend">
+        <span class="leg leg-bankroll">Bankroll</span>
+        <span class="leg leg-pnl">Total PnL</span>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
+  </section>
+
+  <!-- MAIN GRID -->
+  <div class="grid">
+    <!-- Traders -->
+    <section class="card">
+      <h2>Tracked traders</h2>
+      <table id="traders"><thead><tr>
+        <th>#</th><th>Trader</th><th>Score</th><th>ROI</th><th>PnL</th><th>Copied</th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+
+    <!-- Positions -->
+    <section class="card">
+      <h2>Open positions</h2>
+      <table id="positions"><thead><tr>
+        <th>Market</th><th>Outcome</th><th>Shares</th><th>Avg</th><th>Now</th><th>uPnL</th><th>%</th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+  </div>
+
+  <!-- SIGNALS -->
+  <section class="card">
+    <h2>Recent signals</h2>
+    <table id="signals"><thead><tr>
+      <th>Time</th><th>Market / Outcome</th><th>Side</th><th>Consensus</th><th>Confidence</th><th>Our $</th><th>Status</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+
+  <!-- RECENT TRADES -->
+  <section class="card">
+    <h2>Recent copied trades</h2>
+    <table id="trades"><thead><tr>
+      <th>Time</th><th>Trader</th><th>Market</th><th>Side</th>
+      <th>Our $</th><th>Fill</th><th>Conf</th><th>Slippage</th><th>Status</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+
+  <!-- METRICS ROW -->
+  <div class="grid">
+    <section class="card" id="exec-metrics">
+      <h2>Execution quality</h2>
+      <div class="metric-list" id="metric-list">
+        <div class="metric-item"><span class="label">Avg latency</span><span id="m-lat" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Avg slippage</span><span id="m-slip" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Avg confidence</span><span id="m-conf" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Avg consensus</span><span id="m-cons" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Fills analysed</span><span id="m-count" class="value">—</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Risk state</h2>
+      <div class="metric-list" id="risk-list">
+        <div class="metric-item"><span class="label">Daily loss limit</span><span id="r-daily" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Weekly loss limit</span><span id="r-weekly" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Circuit breaker</span><span id="r-cb" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Consecutive losses</span><span id="r-streak" class="value">—</span></div>
+        <div class="metric-item"><span class="label">Daily start equity</span><span id="r-de" class="value">—</span></div>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <span id="foot-config"></span>
+    <span class="disclaimer">Paper mode simulates fills. Live trading spends real USDC and is controlled by <code>LIVE_TRADING</code> in <code>.env</code>.</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
