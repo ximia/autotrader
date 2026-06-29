@@ -63,7 +63,8 @@ def compute_summary() -> PnLSummary:
         realized = sum(p.realized_pnl_usd for p in positions)
         unrealized = positions_value - cost_basis
 
-        cash = state.paper_cash_usd if not settings.live_trading else 0.0
+        # In live mode use the on-chain balance tracked by the engine each cycle.
+        cash = state.usdc_available if settings.live_trading else state.paper_cash_usd
         bankroll = cash + positions_value
 
         # Win rate over positions that have realised something (closed or trimmed).

@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.config import Settings, get_settings
 from app.copier import risk as risk_mgr
@@ -35,7 +35,7 @@ from app.copier.market_filter import check_market, check_slippage
 from app.copier.ranking import LeaderboardTrader, score_all
 from app.copier.signal_engine import Signal, SignalEngine
 from app.db import get_state, reset_daily_spend_if_needed, session_scope
-from app.models import BotState, CopyTrade, Position, SignalEvent, Trader, TraderScoreHistory
+from app.models import BotState, CopyTrade, FollowedTrader, Position, SignalEvent, Trader, TraderScoreHistory
 from app.polymarket.data_client import DataClient, SourceTrade
 from app.polymarket.gamma_client import GammaClient
 
@@ -224,52 +224,102 @@ class CopyEngine:
 
         return report
 
-    # ── LEADERBOARD REFRESH ──────────────────────────────────────────────────
+    # ── LEADERBOARD / FOLLOW LIST ────────────────────────────────────────────
 
     def _maybe_refresh_leaderboard(self, settings: Settings) -> tuple[list[str], dict[str, float]]:
-        """Return (wallet_list, trader_scores) refreshing DB if due."""
+        """Return (wallet_list, trader_scores) sourced from the FollowedTrader
+        table that is maintained by the slow lb_refresh scheduler job.
+
+        Falls back to the legacy inline leaderboard fetch when the table is
+        empty (e.g. first startup before the slow job has run).
+        """
+        wallets, scores = self._wallets_from_follow_list(settings)
+        if wallets:
+            return wallets, scores
+
+        # Follow list not populated yet — use legacy path to avoid an empty
+        # first cycle. The slow job will populate FollowedTrader shortly.
+        log.info("follow list empty, using legacy leaderboard fetch for this cycle")
+        return self._legacy_refresh_leaderboard(settings)
+
+    def _wallets_from_follow_list(self, settings: Settings) -> tuple[list[str], dict[str, float]]:
+        """Read active FollowedTrader rows and sync them into the Trader table."""
         with session_scope() as s:
-            state = get_state(s)
-            last = state.leaderboard_refreshed_at
-            now = dt.datetime.now(dt.timezone.utc)
-            if last is not None:
-                last_utc = last.replace(tzinfo=dt.timezone.utc) if last.tzinfo is None else last
-                if (now - last_utc).total_seconds() < settings.leaderboard_refresh_min * 60:
-                    # Return cached wallets + scores from DB.
-                    wallets = list(
-                        s.scalars(
-                            select(Trader.wallet)
-                            .where(Trader.tracked.is_(True))
-                            .order_by(Trader.rank)
-                        )
-                    )
-                    scores = {
-                        t.wallet: t.composite_score
-                        for t in s.scalars(select(Trader).where(Trader.tracked.is_(True))).all()
-                    }
-                    return wallets, scores
+            active_followed = s.scalars(
+                select(FollowedTrader).where(
+                    FollowedTrader.banned.is_(False),
+                    or_(
+                        FollowedTrader.dropped_at.is_(None),
+                        FollowedTrader.pinned.is_(True),
+                    ),
+                ).order_by(FollowedTrader.best_rank)
+            ).all()
 
-        return self._refresh_leaderboard(settings)
+            if not active_followed:
+                return [], {}
 
-    def _refresh_leaderboard(self, settings: Settings) -> tuple[list[str], dict[str, float]]:
+            # Upsert into Trader table so the copy engine's cursor/scoring
+            # state is maintained per wallet.
+            tracked_wallets = set()
+            for ft in active_followed:
+                t = s.get(Trader, ft.proxy_wallet)
+                if t is None:
+                    t = Trader(wallet=ft.proxy_wallet, last_seen_ts=0)
+                    s.add(t)
+                t.username = ft.username
+                t.rank = ft.best_rank
+                t.pnl = ft.pnl
+                t.volume = ft.vol
+                t.tracked = True
+                tracked_wallets.add(ft.proxy_wallet)
+
+            # Un-track Trader rows that are no longer in the follow list.
+            for t in s.scalars(select(Trader).where(Trader.tracked.is_(True))).all():
+                if t.wallet not in tracked_wallets and t.wallet not in settings.allowlist:
+                    t.tracked = False
+
+            # Always keep allowlisted wallets tracked.
+            for addr in settings.allowlist:
+                t = s.get(Trader, addr.lower())
+                if t is None:
+                    t = Trader(wallet=addr.lower(), last_seen_ts=0)
+                    s.add(t)
+                t.tracked = True
+                tracked_wallets.add(addr.lower())
+
+            wallets = [ft.proxy_wallet for ft in active_followed] + [
+                a for a in settings.allowlist if a.lower() not in {f.proxy_wallet for f in active_followed}
+            ]
+            # Composite scores: use pnl normalised 0–1 as a proxy until the
+            # ranking module has run (it runs in the slow job, not here).
+            max_pnl = max((ft.pnl for ft in active_followed), default=1.0) or 1.0
+            scores = {ft.proxy_wallet: min(ft.pnl / max_pnl, 1.0) for ft in active_followed}
+
+        log.info(
+            "follow list: %d active traders (top: %s)",
+            len(active_followed),
+            [ft.username or ft.proxy_wallet[:10] for ft in active_followed[:3]],
+        )
+        return list(dict.fromkeys(wallets)), scores
+
+    def _legacy_refresh_leaderboard(self, settings: Settings) -> tuple[list[str], dict[str, float]]:
+        """Inline leaderboard fetch used only when FollowedTrader table is empty."""
         board = self.data.leaderboard(
             window=settings.leaderboard_window,
             category=settings.leaderboard_category,
             limit=settings.top_n,
         )
         if not board:
-            log.warning("leaderboard returned empty; retaining current traders")
             with session_scope() as s:
-                wallets = list(
-                    s.scalars(select(Trader.wallet).where(Trader.tracked.is_(True)).order_by(Trader.rank))
-                )
+                wallets = list(s.scalars(
+                    select(Trader.wallet).where(Trader.tracked.is_(True)).order_by(Trader.rank)
+                ))
                 scores = {
                     t.wallet: t.composite_score
                     for t in s.scalars(select(Trader).where(Trader.tracked.is_(True))).all()
                 }
             return wallets, scores
 
-        # Score traders using recent fills (parallel fetch).
         fill_wallets = [lt.wallet for lt in board]
         fills_by_wallet = self.data.fetch_all_trades(fill_wallets, limit=50, since_ts=0)
         trader_scores_obj = score_all(board, fills_by_wallet)
@@ -277,14 +327,11 @@ class CopyEngine:
 
         with session_scope() as s:
             state = get_state(s)
-            # Un-track all.
             for t in s.scalars(select(Trader).where(Trader.tracked.is_(True))).all():
                 t.tracked = False
-
             for lt in board:
                 score = scores_map.get(lt.wallet, 0.0)
                 ts_obj = next((x for x in trader_scores_obj if x.wallet == lt.wallet), None)
-
                 t = s.get(Trader, lt.wallet)
                 if t is None:
                     t = Trader(wallet=lt.wallet, last_seen_ts=0)
@@ -294,13 +341,7 @@ class CopyEngine:
                 t.pnl = lt.pnl
                 t.volume = lt.volume
                 t.composite_score = score
-                t.roi_estimate = ts_obj.roi_estimate if ts_obj else 0.0
-                t.win_rate_proxy = ts_obj.win_rate_proxy if ts_obj else 0.0
-                t.sharpe_proxy = ts_obj.sharpe_proxy if ts_obj else 0.0
-                t.trade_count = ts_obj.activity if ts_obj else 0
                 t.tracked = True
-                t.last_scored_at = dt.datetime.now(dt.timezone.utc)
-
                 if ts_obj:
                     s.add(TraderScoreHistory(
                         wallet=lt.wallet,
@@ -311,23 +352,16 @@ class CopyEngine:
                         conviction_score=ts_obj.conviction,
                         recency_score=ts_obj.recency,
                     ))
-
-            # Always track allowlisted wallets.
             for addr in settings.allowlist:
                 t = s.get(Trader, addr.lower())
                 if t is None:
                     t = Trader(wallet=addr.lower(), last_seen_ts=0)
                     s.add(t)
                 t.tracked = True
-
             state.leaderboard_refreshed_at = dt.datetime.now(dt.timezone.utc)
-            wallets = [lt.wallet for lt in board] + settings.allowlist
 
-        log.info("leaderboard refreshed: %d traders, scores=%s",
-                 len(board),
-                 {w[:8]: round(v, 2) for w, v in list(scores_map.items())[:5]})
-
-        return list(dict.fromkeys(wallets)), scores_map  # deduplicated
+        log.info("legacy leaderboard: %d traders", len(board))
+        return [lt.wallet for lt in board] + settings.allowlist, scores_map
 
     # ── EXITS ────────────────────────────────────────────────────────────────
 

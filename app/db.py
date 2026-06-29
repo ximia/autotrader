@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
-from app.models import Base, BotState
+from app.models import Base, BotState, FollowedTrader
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ def _migrate() -> None:
             "consecutive_losses INTEGER DEFAULT 0",
             "last_loss_at DATETIME",
             "circuit_breaker_active BOOLEAN DEFAULT 0",
+            "follow_list_refreshed_at DATETIME",
         ],
     }
 

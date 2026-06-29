@@ -35,6 +35,28 @@ class Settings(BaseSettings):
     trader_allowlist: str = ""
     trader_blocklist: str = ""
 
+    # ── leaderboard v1 (dedicated slow-refresh job) ───────────────────────────
+    # How many total ranks to pull (paginated in blocks of 50).
+    leaderboard_ranks_to_pull: int = Field(default=100, ge=1, le=1000)
+    # Comma-separated time windows that must ALL contain a wallet for it to pass
+    # the consistency filter. E.g. "WEEK,MONTH" means the wallet must appear in
+    # both the WEEK board and the MONTH board.
+    leaderboard_consistency_windows: str = "WEEK,MONTH"
+    # Rank wallets by profit (PNL) or volume (VOL).
+    leaderboard_order_by: str = "PNL"
+    # Minimum PnL (USD) a wallet must have to enter the follow list.
+    leaderboard_min_pnl: float = Field(default=0.0, ge=0)
+    # Minimum volume (USD) a wallet must have to enter the follow list.
+    leaderboard_min_vol: float = Field(default=0.0, ge=0)
+    # Only follow wallets with a verified Polymarket badge.
+    leaderboard_verified_only: bool = False
+    # How often (minutes) to run the slow leaderboard refresh job.
+    leaderboard_slow_refresh_min: float = Field(default=60.0, gt=0)
+
+    @property
+    def consistency_windows(self) -> list[str]:
+        return [w.strip().upper() for w in self.leaderboard_consistency_windows.split(",") if w.strip()]
+
     # ── signal engine ────────────────────────────────────────────────────────
     # Minimum confidence score (0–1) required to execute a signal.
     min_signal_confidence: float = Field(default=0.55, ge=0.0, le=1.0)

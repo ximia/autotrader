@@ -24,3 +24,4 @@ venv/
 *.swp
 .idea/
 .vscode/
+bot.log

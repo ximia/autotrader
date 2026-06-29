@@ -60,6 +60,41 @@ class Trader(Base):
     score_history: Mapped[list["TraderScoreHistory"]] = relationship(back_populates="trader")
 
 
+class FollowedTrader(Base):
+    """Persisted follow list derived from the /v1/leaderboard consistency filter.
+
+    This is the source-of-truth for *which* wallets the copy pipeline tracks.
+    The copy engine reads active (not banned) rows from here instead of
+    re-deriving the leaderboard every cycle.
+
+    pin=True  → always follow regardless of future leaderboard results.
+    banned=True → never follow regardless of leaderboard (overrides pin).
+    dropped_at set → wallet no longer on the leaderboard but kept for history.
+    """
+
+    __tablename__ = "followed_traders"
+
+    proxy_wallet: Mapped[str] = mapped_column(String, primary_key=True)
+    username: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    verified_badge: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Snapshot of stats at the last leaderboard refresh.
+    pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    vol: Mapped[float] = mapped_column(Float, default=0.0)
+    best_rank: Mapped[int] = mapped_column(Integer, default=0)
+    # JSON list of windows this wallet appeared in, e.g. '["WEEK","MONTH"]'.
+    windows_seen: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Manual overrides.
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    banned: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_utcnow)
+    last_seen_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    # Set when wallet drops off the leaderboard. Pinned wallets are kept active.
+    dropped_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class TraderScoreHistory(Base):
     """Periodic snapshot of a trader's composite quality score."""
 
@@ -254,6 +289,9 @@ class BotState(Base):
     live_ready: Mapped[bool] = mapped_column(Boolean, default=True)
     live_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     usdc_available: Mapped[float] = mapped_column(Float, default=0.0)
+
+    # Slow leaderboard refresh (separate from fast copy-loop cadence).
+    follow_list_refreshed_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
 
     # Run stats.
     last_run_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)

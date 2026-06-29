@@ -120,34 +120,46 @@ class DataClient:
     def _leaderboard_from_api(
         self, window: str, category: str, limit: int
     ) -> list[LeaderboardTrader]:
+        # /v1/leaderboard — the only working endpoint (no /v1/ → 404).
         try:
-            data = self._get(
-                "/leaderboard",
-                {"window": window, "category": category, "limit": limit},
+            resp = self._client.get(
+                f"{self.base_url}/v1/leaderboard",
+                params={
+                    "timePeriod": window,
+                    "orderBy": "PNL",
+                    "category": category,
+                    "limit": min(limit, 50),  # hard max per spec
+                },
             )
+            resp.raise_for_status()
+            rows = resp.json()
         except Exception as exc:
-            log.debug("leaderboard API unavailable (%s), falling back to trade scan", exc)
+            log.debug("leaderboard /v1/ unavailable (%s), falling back to trade scan", exc)
             return []
 
-        rows = data if isinstance(data, list) else data.get("data", [])
+        rows = rows if isinstance(rows, list) else rows.get("data", [])
         if not rows:
             return []
 
         out: list[LeaderboardTrader] = []
-        for i, r in enumerate(rows[:limit]):
-            wallet = (r.get("proxyWallet") or r.get("proxy_wallet") or "").lower()
+        for r in rows[:limit]:
+            wallet = (r.get("proxyWallet") or "").lower()
             if not wallet:
                 continue
+            try:
+                rank = int(r.get("rank") or 0)
+            except (ValueError, TypeError):
+                rank = 0
             out.append(
                 LeaderboardTrader(
                     wallet=wallet,
-                    username=r.get("name") or r.get("username") or None,
+                    username=r.get("userName") or None,
                     pnl=float(r.get("pnl") or 0),
-                    volume=float(r.get("volume") or 0),
-                    rank=i + 1,
+                    volume=float(r.get("vol") or 0),
+                    rank=rank,
                 )
             )
-        log.debug("leaderboard API returned %d traders", len(out))
+        log.debug("leaderboard /v1/ returned %d traders", len(out))
         return out
 
     def _leaderboard_from_trades(self, limit: int) -> list[LeaderboardTrader]:
@@ -221,7 +233,18 @@ class DataClient:
         taker_only: bool = True,
         since_ts: Optional[int] = None,
     ) -> list[SourceTrade]:
-        """Fetch recent trades for a single wallet."""
+        """Fetch recent trades for a wallet.
+
+        Tries /activity first (has transactionHash for reliable dedup), then
+        falls back to /trades.
+        """
+        result = self._trades_from_activity(user, limit=limit, since_ts=since_ts)
+        if result is not None:
+            if side:
+                result = [t for t in result if t.side == side.upper()]
+            return result
+
+        # Fallback to legacy /trades endpoint.
         params: dict[str, Any] = {
             "user": user,
             "limit": limit,
@@ -229,16 +252,92 @@ class DataClient:
         }
         if side:
             params["side"] = side
-
         try:
             data = self._get("/trades", params)
         except Exception as exc:
             log.warning("trades fetch failed for %s: %s", user, exc)
             return []
 
-        rows = data if isinstance(data, list) else data.get("data", [])
-        out: list[SourceTrade] = []
+        return self._parse_trades_rows(
+            data if isinstance(data, list) else data.get("data", []),
+            user=user,
+            since_ts=since_ts,
+        )
 
+    def _trades_from_activity(
+        self,
+        user: str,
+        limit: int = 50,
+        since_ts: Optional[int] = None,
+    ) -> Optional[list[SourceTrade]]:
+        """Fetch from /activity?type=TRADE.  Returns None if the endpoint fails
+        so the caller can fall back to /trades."""
+        try:
+            resp = self._client.get(
+                f"{self.base_url}/activity",
+                params={"user": user, "type": "TRADE", "limit": limit},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+        except Exception as exc:
+            log.debug("activity endpoint unavailable for %s: %s", user, exc)
+            return None
+
+        rows = rows if isinstance(rows, list) else rows.get("data", [])
+        return self._parse_activity_rows(rows, user=user, since_ts=since_ts)
+
+    def _parse_activity_rows(
+        self,
+        rows: list[dict],
+        *,
+        user: str,
+        since_ts: Optional[int],
+    ) -> list[SourceTrade]:
+        out: list[SourceTrade] = []
+        for row in rows:
+            token_id = str(row.get("asset") or "")
+            if not token_id:
+                continue
+            ts = int(row.get("timestamp") or 0)
+            if since_ts and ts <= since_ts:
+                continue
+            price = float(row.get("price") or 0)
+            # /activity reports size in USD ("usdcSize") and also raw shares.
+            usdc_size = float(row.get("usdcSize") or 0)
+            shares = float(row.get("size") or 0)
+            if price <= 0:
+                continue
+            # Use usdcSize/price to derive shares when the field gives USD not shares.
+            if shares <= 0 and usdc_size > 0:
+                shares = usdc_size / price
+            if shares <= 0:
+                continue
+            tx_hash = row.get("transactionHash") or "tx"
+            out.append(
+                SourceTrade(
+                    # Dedup key: transactionHash is stable and unique per /activity spec.
+                    id=f"{tx_hash}:{token_id}",
+                    wallet=(row.get("proxyWallet") or user).lower(),
+                    token_id=token_id,
+                    condition_id=row.get("conditionId"),
+                    side=str(row.get("side", "")).upper() or "BUY",
+                    price=price,
+                    shares=shares,
+                    timestamp=ts,
+                    market_question=row.get("title"),
+                    outcome=row.get("outcome"),
+                )
+            )
+        return out
+
+    def _parse_trades_rows(
+        self,
+        rows: list[dict],
+        *,
+        user: str,
+        since_ts: Optional[int],
+    ) -> list[SourceTrade]:
+        out: list[SourceTrade] = []
         for row in rows:
             token_id = str(row.get("asset") or "")
             if not token_id:
