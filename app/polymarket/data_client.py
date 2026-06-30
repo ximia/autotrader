@@ -399,17 +399,24 @@ class DataClient:
         limit: int = 500,
         since_ts: Optional[int] = None,
     ) -> dict[str, list[SourceTrade]]:
-        """Fetch the most recent platform-wide trades and group by wallet.
+        """Fetch the most recent platform-wide trades and group by wallet."""
+        data = None
+        # Try with increasing limits — start small so fast cycles still work
+        for attempt_limit in [min(limit, 300), min(limit, 500), limit]:
+            try:
+                params: dict[str, Any] = {"limit": attempt_limit, "takerOnly": "true"}
+                url = f"{self.base_url}/trades"
+                with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)) as c:
+                    resp = c.get(url, params={k: v for k, v in params.items() if v is not None})
+                    resp.raise_for_status()
+                    data = resp.json()
+                break
+            except Exception as exc:
+                log.debug("global scan attempt %d failed: %s", attempt_limit, exc)
+                continue
 
-        This scans ALL traders on Polymarket, not just the follow list.
-        Used by the signal engine to detect when many different wallets
-        are piling into the same market — the real momentum signal.
-        """
-        try:
-            params: dict[str, Any] = {"limit": limit, "takerOnly": "true"}
-            data = self._get("/trades", params)
-        except Exception as exc:
-            log.warning("global momentum scan failed: %s", exc)
+        if data is None:
+            log.warning("global momentum scan failed after retries")
             return {}
 
         rows = data if isinstance(data, list) else data.get("data", [])
