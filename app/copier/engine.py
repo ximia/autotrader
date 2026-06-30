@@ -511,7 +511,15 @@ class CopyEngine:
 
         # ── execute ───────────────────────────────────────────────────────
         t0 = time.monotonic()
-        result = self.executor.buy(sig.token_id, usd, cur_price)
+        try:
+            result = self.executor.buy(sig.token_id, usd, cur_price)
+        except Exception as exc:
+            err = str(exc)
+            # "No orderbook" = market not on CLOB; skip silently.
+            reason = f"exec:no_orderbook" if "orderbook" in err.lower() else f"exec:{err[:60]}"
+            self._record_signal(sig, executed=False, skip_reason=reason)
+            report.signals_skipped += 1
+            return False
         total_latency_ms = round((time.monotonic() - t0) * 1000, 2)
 
         slippage = (result.fill_price - cur_price) / cur_price if cur_price > 0 else 0.0
