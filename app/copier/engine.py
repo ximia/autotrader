@@ -188,6 +188,15 @@ class CopyEngine:
 
         report.signals_evaluated = len(signals)
 
+        # ── batch-fetch all signal market data in one API call ────────────
+        # Without this, each signal makes a separate gamma HTTP request,
+        # making a 16-signal cycle take 3–5 minutes.
+        if signals:
+            try:
+                self.gamma.prefetch_tokens([s.token_id for s in signals])
+            except Exception:
+                pass
+
         # ── per-signal: risk check → Kelly → execute ──────────────────────
         bankroll = self._bankroll()
         for sig in signals:

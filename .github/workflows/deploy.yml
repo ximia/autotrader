@@ -1,0 +1,24 @@
+name: Deploy to AWS Lightsail
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 108.131.82.3
+          username: ubuntu
+          key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            cd ~/trade
+            git fetch origin main
+            git reset --hard origin/main
+            sudo systemctl restart polybot
+            echo "Deploy complete at $(date)"

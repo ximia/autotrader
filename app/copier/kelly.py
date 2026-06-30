@@ -100,10 +100,11 @@ def kelly_size(
     usd_capped = min(usd_kelly, bankroll * max_kelly_bet_pct, max_per_trade_usd)
     usd = max(usd_capped, 0.0)
 
-    if usd < min_order_usd:
-        # Positive-edge signal but bet is below minimum — floor to min_order_usd
-        # so valid signals always place at least the minimum trade.
-        usd = min_order_usd
+    # Floor: Polymarket rejects orders below $1.00 regardless of our min_order_usd setting.
+    # If Kelly produces a tiny-but-positive bet, floor it to whichever is higher.
+    _pm_floor = max(min_order_usd, 1.0)
+    if usd < _pm_floor:
+        usd = _pm_floor
 
     return KellyResult(
         usd=round(usd, 2),

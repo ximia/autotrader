@@ -153,6 +153,49 @@ class GammaClient:
             pass
         return info
 
+    def prefetch_tokens(self, token_ids: list[str]) -> None:
+        """Fetch market data for multiple tokens in a single API call.
+
+        Called before the signal-execution loop so that individual
+        market_for_token() calls can be served from cache rather than
+        making one HTTP request per signal (which was making each cycle
+        take 3–5 minutes instead of a few seconds).
+        """
+        if not token_ids:
+            return
+        now = time.time()
+        # Only fetch tokens whose cache is stale or missing.
+        needed = [
+            tid for tid in token_ids
+            if tid not in self._cache
+            or (now - self._cache[tid].price_fetched_at) >= _PRICE_TTL
+        ]
+        if not needed:
+            return
+
+        # Gamma accepts comma-separated token IDs in one request.
+        BATCH = 50
+        for i in range(0, len(needed), BATCH):
+            chunk = needed[i : i + BATCH]
+            try:
+                resp = self._client.get(
+                    f"{self.base_url}/markets",
+                    params={"clob_token_ids": ",".join(chunk)},
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                rows = rows if isinstance(rows, list) else rows.get("data", []) or []
+                for row in rows:
+                    for tid in _as_list(row.get("clobTokenIds")):
+                        info = _parse_market(row, tid)
+                        if info:
+                            with self._lock:
+                                self._cache[tid] = info
+            except Exception as exc:
+                log.debug("prefetch batch %d failed: %s", i // BATCH, exc)
+
+        log.debug("prefetch: %d tokens requested, %d fetched", len(needed), len(needed))
+
     def invalidate(self, token_id: str) -> None:
         """Remove a token from cache (e.g. after a fill)."""
         with self._lock:
