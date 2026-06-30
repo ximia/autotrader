@@ -36,17 +36,18 @@ class ClobTrader:
 
         self._settings = settings
 
-        # Map old signature types to v2 equivalents.
-        # Old type 2 (browser proxy/MetaMask) maps to POLY_GNOSIS_SAFE (int=2)
-        # so that SignatureTypeV1(int(sig)) == 2 when forcing V1 orders —
-        # matching what Polymarket's website uses for proxy wallet orders.
+        # The proxy wallet (0x80872...) is an EIP-1271 smart wallet:
+        # - owner() returns the user's EOA (0x18CeD...)
+        # - isValidSignature() is implemented
+        # - the CLOB V2 verifies orders by calling wallet.isValidSignature(hash, sig)
+        # So we use POLY_1271 with the proxy wallet as funder for all proxy wallet types.
         sig_map = {
             0: SignatureTypeV2.EOA,
-            1: SignatureTypeV2.POLY_PROXY,
-            2: SignatureTypeV2.POLY_GNOSIS_SAFE,  # browser proxy → V1 type 2
-            3: SignatureTypeV2.POLY_1271,
+            1: SignatureTypeV2.POLY_1271,   # Magic proxy → EIP-1271
+            2: SignatureTypeV2.POLY_1271,   # Browser proxy → EIP-1271 (wallet owns itself via EOA)
+            3: SignatureTypeV2.POLY_1271,   # explicit EIP-1271
         }
-        sig_type = sig_map.get(settings.signature_type, SignatureTypeV2.POLY_GNOSIS_SAFE)
+        sig_type = sig_map.get(settings.signature_type, SignatureTypeV2.POLY_1271)
 
         # Derive L2 API credentials from private key.
         temp = ClobClient(
@@ -152,17 +153,14 @@ class ClobTrader:
     # ── orders ────────────────────────────────────────────────────────────────
 
     def market_buy(self, *, token_id: str, usd: float) -> dict:
-        """Buy `usd` worth of `token_id`.
+        """Buy `usd` of `token_id` using POLY_1271 V2 orders.
 
-        Forces V1 order format so orders are signed for the old exchange
-        (0x4bFb...) which accepts the old-style proxy wallet as maker.
-        The CLOB V2 server rejects proxy wallets on V2 orders — proxy wallets
-        are still accepted on V1 orders, matching how the website places trades.
+        The proxy wallet (funder) is an EIP-1271 contract whose owner is the
+        user's EOA. The CLOB V2 verifies orders by calling
+        funder.isValidSignature(orderHash, ecdsaSig) — the proxy wallet
+        validates the EOA signature and returns the EIP-1271 magic value.
         """
         from py_clob_client_v2 import MarketOrderArgsV2, OrderType, Side
-
-        # Force V1 order format — proxy wallets are only accepted by the V1 exchange.
-        self._client._ClobClient__cached_version = 1
 
         args = MarketOrderArgsV2(
             token_id=token_id,
@@ -170,10 +168,7 @@ class ClobTrader:
             side=Side.BUY,
             order_type=OrderType.FOK,
         )
-        try:
-            resp = self._client.create_and_post_market_order(args)
-        finally:
-            self._client._ClobClient__cached_version = None  # reset for data fetches
+        resp = self._client.create_and_post_market_order(args)
         return _normalise(resp)
 
     def limit_sell(self, *, token_id: str, shares: float, price: float) -> dict:
