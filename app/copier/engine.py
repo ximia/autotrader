@@ -209,7 +209,7 @@ class CopyEngine:
         # momentum — not limited to our 24 tracked wallets.
         try:
             global_fills = self.data.global_momentum_scan(
-                limit=500,
+                limit=200,
                 since_ts=now_ts - int(settings.signal_window_min * 60),
             )
             for wallet, fills in global_fills.items():
