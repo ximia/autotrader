@@ -24,12 +24,13 @@ from typing import Optional
 # BOTH the config module AND client module (which imports it directly via
 # "from .config import get_contract_config", so the config-level patch alone
 # has no effect on the already-bound reference inside client.py).
-_NATIVE_USDC    = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
-# New Polymarket exchange contract (old 0x4bFb... is no longer accepted).
-# Derived from the allowance spenders returned by /balance-allowance on 2026-06-29.
-_NEW_EXCHANGE   = "0xE111180000d2663C0091e4f400237545B87B996B"
-_NEW_EXCHANGE_NR = "0xe2222d279d744050d28e00520010520000310F59"  # neg-risk variant
+_NATIVE_USDC = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
 
+# Only patch the collateral token (USDC.e → native USDC).
+# The exchange contract is kept as-is — the CLOB order signing must use
+# the same contract the CLOB server expects, and "invalid order version"
+# errors indicate a mismatch. The original 0x4bFb... is still correct for
+# order signing even though settlement uses newer contracts.
 try:
     import py_clob_client.config as _clob_cfg
     import py_clob_client.client as _clob_client_mod
@@ -41,7 +42,7 @@ try:
         cfg = _orig(chainID, neg_risk)
         if chainID == 137:
             cfg = _clob_types.ContractConfig(
-                exchange=_NEW_EXCHANGE_NR if neg_risk else _NEW_EXCHANGE,
+                exchange=cfg.exchange,          # keep original exchange address
                 collateral=_NATIVE_USDC,
                 conditional_tokens=cfg.conditional_tokens,
             )
