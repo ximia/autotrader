@@ -324,6 +324,47 @@ def api_metrics() -> dict:
 # HEALTH
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.get("/api/activity")
+def api_activity() -> list[dict]:
+    """Recent cycle activity for the live feed."""
+    with session_scope() as s:
+        sigs = s.scalars(
+            select(SignalEvent).order_by(desc(SignalEvent.ts)).limit(10)
+        ).all()
+        trades = s.scalars(
+            select(CopyTrade).where(CopyTrade.status.in_(["filled", "submitted"]))
+            .order_by(desc(CopyTrade.created_at)).limit(5)
+        ).all()
+
+    events = []
+    for sig in sigs:
+        events.append({
+            "ts": sig.ts.isoformat(),
+            "type": "signal",
+            "executed": sig.executed,
+            "market": (sig.market_question or "")[:45],
+            "outcome": sig.outcome or "",
+            "confidence": round(sig.confidence, 2),
+            "consensus": sig.consensus_count,
+            "usd": round(sig.usd_executed, 2),
+            "skip_reason": sig.skip_reason,
+        })
+    for t in trades:
+        events.append({
+            "ts": t.created_at.isoformat(),
+            "type": "trade",
+            "executed": True,
+            "market": (t.market_question or "")[:45],
+            "outcome": t.outcome or "",
+            "usd": round(t.our_usd, 2),
+            "fill_price": t.fill_price,
+            "status": t.status,
+        })
+
+    events.sort(key=lambda e: e["ts"], reverse=True)
+    return events[:15]
+
+
 @app.get("/api/health")
 def api_health() -> dict:
     sched = get_scheduler()

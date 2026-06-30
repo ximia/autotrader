@@ -123,6 +123,7 @@ async function refresh() {
       ]);
 
     renderStatus(status, pnlData.summary);
+    updateActivityFeed(status);
     renderChart(pnlData.curve);
     renderTraders(traders);
     renderPositions(positions);
@@ -399,8 +400,55 @@ $("btn-reset-cb").addEventListener("click", async () => {
   refresh();
 });
 
+// ── ACTIVITY FEED ─────────────────────────────────────────────────────────────
+
+const _activityLog = [];
+let _lastRunStatus = "";
+let _lastRunAt = "";
+let _refreshCount = 0;
+
+function pushActivity(msg, color = "#8b949e") {
+  const now = new Date().toLocaleTimeString();
+  _activityLog.unshift(`<span style="color:#444">[${now}]</span> <span style="color:${color}">${msg}</span>`);
+  if (_activityLog.length > 20) _activityLog.pop();
+  const el = $("activity-feed");
+  if (el) el.innerHTML = _activityLog.join("<br>");
+}
+
+function updateActivityFeed(s) {
+  // Update refresh counter
+  _refreshCount++;
+  const tick = $("refresh-tick");
+  if (tick) tick.textContent = `auto-refreshing every 5s · refresh #${_refreshCount}`;
+
+  // Log when a new cycle completes
+  if (s.last_run_status && s.last_run_status !== _lastRunStatus) {
+    _lastRunStatus = s.last_run_status;
+    const parts = s.last_run_status.match(/signals=(\d+) executed=(\d+) skipped=(\d+)/);
+    if (parts) {
+      const [, sigs, exec, skip] = parts;
+      const color = parseInt(exec) > 0 ? "#3fb950" : "#8b949e";
+      pushActivity(`Cycle: scanned ${sigs} signals → ${exec} executed, ${skip} skipped`, color);
+    } else {
+      pushActivity(`Cycle: ${s.last_run_status}`);
+    }
+  }
+
+  // Log when a new cycle starts (last_run_at changes)
+  if (s.last_run_at && s.last_run_at !== _lastRunAt) {
+    _lastRunAt = s.last_run_at;
+  }
+
+  // Show next run countdown
+  if (s.next_run_at) {
+    const secsUntil = Math.max(0, Math.round((new Date(s.next_run_at) - Date.now()) / 1000));
+    $("s-next").textContent = secsUntil > 0 ? `in ${secsUntil}s` : "now";
+  }
+}
+
 // ── BOOT ─────────────────────────────────────────────────────────────────────
 
 initChart();
+pushActivity("Dashboard connected — bot monitoring started", "#58a6ff");
 refresh();
 setInterval(refresh, 5000);
