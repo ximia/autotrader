@@ -154,7 +154,7 @@ class SignalEngine:
         reasons.append(f"consensus={n}(w={consensus_w:.2f})")
 
         # 2. Trader quality — average composite score of participating traders.
-        scores = [trader_scores.get(w, 0.3) for w, _ in unique]
+        scores = [trader_scores.get(w, 0.5) for w, _ in unique]
         avg_score = sum(scores) / len(scores)
         trader_quality_w = avg_score
         reasons.append(f"quality={avg_score:.2f}")
