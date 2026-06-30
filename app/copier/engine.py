@@ -137,64 +137,23 @@ class CopyEngine:
             log.warning("no tracked traders — skipping cycle")
             return report
 
-        # ── parallel fetch of recent fills ────────────────────────────────
+        # ── global scan — single fast API call replaces 24 slow wallet fetches ──
+        # One request gets 200 recent trades from ALL wallets on the platform.
+        # Per-wallet fetches took 1-3 minutes; this takes ~2 seconds.
         now_ts = int(time.time())
-        signal_window_ts = now_ts - int(settings.signal_window_min * 60)
-
-        # Per-trader cursors: only feed fills newer than cursor to the signal
-        # engine so we don't re-fire signals on stale data.
-        cursor_by_wallet: dict[str, int] = {}
-        with session_scope() as s:
-            for wallet in wallets:
-                t = s.get(Trader, wallet)
-                cursor_by_wallet[wallet] = t.last_seen_ts if t else 0
-
-        # Use the most conservative lookback: max(signal_window_ts, cursor).
-        # On first sight (cursor=0), respect initial_lookback_min.
         fills_by_wallet: dict[str, list[SourceTrade]] = {}
-        for wallet in wallets:
-            cursor = cursor_by_wallet[wallet]
-            if cursor == 0:
-                if settings.initial_lookback_min <= 0:
-                    # On first run with no lookback: advance cursor to now, skip fills.
-                    with session_scope() as s:
-                        t = s.get(Trader, wallet)
-                        if t:
-                            t.last_seen_ts = now_ts
-                    fills_by_wallet[wallet] = []
-                    continue
-                else:
-                    since = now_ts - int(settings.initial_lookback_min * 60)
-            else:
-                since = max(cursor, signal_window_ts)
+        try:
+            fills_by_wallet = self.data.global_momentum_scan(
+                limit=200,
+                since_ts=now_ts - int(settings.signal_window_min * 60),
+            )
+            report.trades_seen = sum(len(v) for v in fills_by_wallet.values())
+            log.info("global scan: %d wallets / %d trades", len(fills_by_wallet), report.trades_seen)
+        except Exception:
+            log.warning("global scan failed — skipping cycle")
+            return report
 
-            fills_by_wallet[wallet] = []  # populated by parallel fetch below
-
-        # Wallets that need fetching (cursor already advanced for the rest).
-        wallets_to_fetch = [w for w in wallets if w not in fills_by_wallet or fills_by_wallet[w] == []]
-        # Distinguish between "skip (cursor=0, no lookback)" and "actually fetch".
-        wallets_to_fetch = [
-            w for w in wallets
-            if not (cursor_by_wallet[w] == 0 and settings.initial_lookback_min <= 0)
-        ]
-
-        if wallets_to_fetch:
-            raw = self.data.fetch_all_trades(wallets_to_fetch, limit=50, since_ts=signal_window_ts)
-            for wallet, fills in raw.items():
-                cursor = cursor_by_wallet[wallet]
-                fills_by_wallet[wallet] = [f for f in fills if f.timestamp > cursor]
-                report.trades_seen += len(fills_by_wallet[wallet])
-
-        # ── advance per-trader cursors ─────────────────────────────────────
-        for wallet, fills in fills_by_wallet.items():
-            if fills:
-                max_ts = max(f.timestamp for f in fills)
-                with session_scope() as s:
-                    t = s.get(Trader, wallet)
-                    if t and max_ts > t.last_seen_ts:
-                        t.last_seen_ts = max_ts
-
-        # ── protective exits ──────────────────────────────────────────────
+        # ── protective exits (check for sells in the global scan) ─────────
         if settings.enable_auto_exits or settings.mirror_exits:
             trader_sold = {
                 f.token_id
@@ -203,21 +162,6 @@ class CopyEngine:
                 if f.side == "SELL"
             }
             self._process_exits(trader_sold, settings)
-
-        # ── global momentum scan ──────────────────────────────────────────────
-        # Scan ALL recent platform trades so we catch any market gaining
-        # momentum — not limited to our 24 tracked wallets.
-        try:
-            global_fills = self.data.global_momentum_scan(
-                limit=200,
-                since_ts=now_ts - int(settings.signal_window_min * 60),
-            )
-            for wallet, fills in global_fills.items():
-                if wallet not in fills_by_wallet:
-                    fills_by_wallet[wallet] = fills
-            log.info("global scan merged: %d total wallets", len(fills_by_wallet))
-        except Exception:
-            log.debug("global scan failed — using follow list only")
 
         # ── consensus signal generation ───────────────────────────────────
         # Filter to BUY fills for signal detection.
