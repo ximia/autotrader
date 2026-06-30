@@ -35,7 +35,7 @@ class PnLSummary:
 
 
 def refresh_position_prices(gamma: GammaClient | None = None) -> None:
-    """Mark open positions to current market price."""
+    """Mark open positions to current market price and detect resolutions."""
     gamma = gamma or GammaClient()
     with session_scope() as session:
         open_positions = list(
@@ -45,9 +45,29 @@ def refresh_position_prices(gamma: GammaClient | None = None) -> None:
             info = gamma.market_for_token(pos.token_id, use_cache=False)
             if info is None:
                 continue
+
             mid = _mid_price(info)
             if mid is not None:
                 pos.cur_price = mid
+                # Track peak price for trailing stop.
+                if (pos.peak_price or 0.0) < mid:
+                    pos.peak_price = mid
+
+            # Detect market resolution — closed markets have prices near 0 or 1.
+            if info.closed and mid is not None:
+                final_price = 1.0 if mid >= 0.95 else 0.0
+                proceeds = pos.shares * final_price
+                realized = proceeds - pos.cost_basis_usd
+                pos.realized_pnl_usd += realized
+                pos.cost_basis_usd = 0.0
+                pos.shares = 0.0
+                pos.cur_price = final_price
+                pos.closed = True
+                log.info(
+                    "market resolved: %s → price=%.0f  pnl=%.2f  (%s)",
+                    pos.token_id[:16], final_price, realized,
+                    pos.market_question or "",
+                )
 
 
 def compute_summary() -> PnLSummary:
