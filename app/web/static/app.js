@@ -405,6 +405,7 @@ $("btn-reset-cb").addEventListener("click", async () => {
 const _activityLog = [];
 let _lastRunStatus = "";
 let _lastRunAt = "";
+let _lastRunsTotal = 0;
 let _refreshCount = 0;
 
 function pushActivity(msg, color = "#8b949e") {
@@ -421,22 +422,18 @@ function updateActivityFeed(s) {
   const tick = $("refresh-tick");
   if (tick) tick.textContent = `auto-refreshing every 5s · refresh #${_refreshCount}`;
 
-  // Log when a new cycle completes
-  if (s.last_run_status && s.last_run_status !== _lastRunStatus) {
+  // Log every completed cycle (track by runs_total counter)
+  if (s.runs_total && s.runs_total !== _lastRunsTotal) {
+    _lastRunsTotal = s.runs_total;
     _lastRunStatus = s.last_run_status;
-    const parts = s.last_run_status.match(/signals=(\d+) executed=(\d+) skipped=(\d+)/);
+    const parts = (s.last_run_status || "").match(/signals=(\d+) executed=(\d+) skipped=(\d+)/);
     if (parts) {
       const [, sigs, exec, skip] = parts;
-      const color = parseInt(exec) > 0 ? "#3fb950" : "#8b949e";
-      pushActivity(`Cycle: scanned ${sigs} signals → ${exec} executed, ${skip} skipped`, color);
+      const color = parseInt(exec) > 0 ? "#3fb950" : parseInt(sigs) > 0 ? "#d29922" : "#8b949e";
+      pushActivity(`Cycle #${s.runs_total}: ${sigs} signals → <b style="color:${color}">${exec} executed</b>, ${skip} skipped`, color);
     } else {
-      pushActivity(`Cycle: ${s.last_run_status}`);
+      pushActivity(`Cycle #${s.runs_total}: ${s.last_run_status || "complete"}`);
     }
-  }
-
-  // Log when a new cycle starts (last_run_at changes)
-  if (s.last_run_at && s.last_run_at !== _lastRunAt) {
-    _lastRunAt = s.last_run_at;
   }
 
   // Show next run countdown
