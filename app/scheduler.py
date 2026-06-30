@@ -144,7 +144,10 @@ def start_scheduler() -> BackgroundScheduler:
     settings = get_settings()
     _scheduler = BackgroundScheduler(timezone="UTC")
 
-    # Fast copy loop.
+    now = dt.datetime.now(dt.timezone.utc)
+
+    # Fast copy loop — starts after one interval so trigger_now() handles
+    # the immediate first cycle without overlap.
     _scheduler.add_job(
         run_cycle,
         "interval",
@@ -152,10 +155,10 @@ def start_scheduler() -> BackgroundScheduler:
         id=JOB_COPY,
         max_instances=1,
         coalesce=True,
-        next_run_time=None,
+        next_run_time=now + dt.timedelta(minutes=settings.poll_interval_min),
     )
 
-    # Slow leaderboard refresh.
+    # Slow leaderboard refresh — first run a few seconds after startup.
     _scheduler.add_job(
         refresh_follow_list,
         "interval",
@@ -163,7 +166,7 @@ def start_scheduler() -> BackgroundScheduler:
         id=JOB_LB,
         max_instances=1,
         coalesce=True,
-        next_run_time=None,  # first run triggered manually after startup
+        next_run_time=now + dt.timedelta(seconds=5),
     )
 
     _scheduler.start()
