@@ -36,18 +36,17 @@ class ClobTrader:
 
         self._settings = settings
 
-        # Map old signature types to v2 equivalents:
-        # 0 = self-custody EOA → EOA
-        # 1 = email/Magic     → POLY_PROXY (Polymarket managed proxy)
-        # 2 = browser proxy   → POLY_PROXY (MetaMask browser proxy wallet)
-        # 3 = POLY_1271       → POLY_1271  (EIP-7702 smart accounts)
+        # Map old signature types to v2 equivalents.
+        # Old type 2 (browser proxy/MetaMask) maps to POLY_GNOSIS_SAFE (int=2)
+        # so that SignatureTypeV1(int(sig)) == 2 when forcing V1 orders —
+        # matching what Polymarket's website uses for proxy wallet orders.
         sig_map = {
             0: SignatureTypeV2.EOA,
             1: SignatureTypeV2.POLY_PROXY,
-            2: SignatureTypeV2.POLY_PROXY,
+            2: SignatureTypeV2.POLY_GNOSIS_SAFE,  # browser proxy → V1 type 2
             3: SignatureTypeV2.POLY_1271,
         }
-        sig_type = sig_map.get(settings.signature_type, SignatureTypeV2.POLY_PROXY)
+        sig_type = sig_map.get(settings.signature_type, SignatureTypeV2.POLY_GNOSIS_SAFE)
 
         # Derive L2 API credentials from private key.
         temp = ClobClient(
@@ -153,8 +152,17 @@ class ClobTrader:
     # ── orders ────────────────────────────────────────────────────────────────
 
     def market_buy(self, *, token_id: str, usd: float) -> dict:
-        """Buy `usd` worth of `token_id` using the new v2 market order API."""
+        """Buy `usd` worth of `token_id`.
+
+        Forces V1 order format so orders are signed for the old exchange
+        (0x4bFb...) which accepts the old-style proxy wallet as maker.
+        The CLOB V2 server rejects proxy wallets on V2 orders — proxy wallets
+        are still accepted on V1 orders, matching how the website places trades.
+        """
         from py_clob_client_v2 import MarketOrderArgsV2, OrderType, Side
+
+        # Force V1 order format — proxy wallets are only accepted by the V1 exchange.
+        self._client._ClobClient__cached_version = 1
 
         args = MarketOrderArgsV2(
             token_id=token_id,
@@ -162,7 +170,10 @@ class ClobTrader:
             side=Side.BUY,
             order_type=OrderType.FOK,
         )
-        resp = self._client.create_and_post_market_order(args)
+        try:
+            resp = self._client.create_and_post_market_order(args)
+        finally:
+            self._client._ClobClient__cached_version = None  # reset for data fetches
         return _normalise(resp)
 
     def limit_sell(self, *, token_id: str, shares: float, price: float) -> dict:
