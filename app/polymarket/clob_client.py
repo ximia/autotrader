@@ -35,16 +35,18 @@ class ClobTrader:
 
         self._settings = settings
 
-        # EIP-7702 (MetaMask Smart Account) wallets use POLY_1271.
-        # Old proxy wallets use POLY_PROXY.
-        # Plain EOA wallets use EOA.
+        # Map old signature types to v2 equivalents:
+        # 0 = self-custody EOA → EOA
+        # 1 = email/Magic     → POLY_PROXY (Polymarket managed proxy)
+        # 2 = browser proxy   → POLY_PROXY (MetaMask browser proxy wallet)
+        # 3 = POLY_1271       → POLY_1271  (EIP-7702 smart accounts)
         sig_map = {
             0: SignatureTypeV2.EOA,
             1: SignatureTypeV2.POLY_PROXY,
             2: SignatureTypeV2.POLY_PROXY,
             3: SignatureTypeV2.POLY_1271,
         }
-        sig_type = sig_map.get(settings.signature_type, SignatureTypeV2.POLY_1271)
+        sig_type = sig_map.get(settings.signature_type, SignatureTypeV2.POLY_PROXY)
 
         # Derive L2 API credentials from private key.
         temp = ClobClient(
