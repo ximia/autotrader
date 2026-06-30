@@ -21,6 +21,7 @@ from app.config import get_settings
 log = logging.getLogger(__name__)
 
 _NATIVE_USDC = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+_PUSD        = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # Polymarket V2 token
 USDC_DECIMALS = 1_000_000
 
 
@@ -93,13 +94,22 @@ class ClobTrader:
             "https://polygon-rpc.com",
         ]:
             try:
-                r = httpx.post(
+                # Check pUSD first (Polymarket V2 token used by proxy wallets).
+                pusd = int(httpx.post(
                     rpc,
                     json={"jsonrpc": "2.0", "method": "eth_call",
-                          "params": [{"to": _NATIVE_USDC, "data": data}, "latest"], "id": 1},
+                          "params": [{"to": _PUSD, "data": data}, "latest"], "id": 1},
                     timeout=8,
-                )
-                return int(r.json().get("result", "0x0"), 16) / USDC_DECIMALS
+                ).json().get("result", "0x0"), 16) / USDC_DECIMALS
+                if pusd > 0:
+                    return pusd
+                # Fall back to native USDC.
+                return int(httpx.post(
+                    rpc,
+                    json={"jsonrpc": "2.0", "method": "eth_call",
+                          "params": [{"to": _NATIVE_USDC, "data": data}, "latest"], "id": 2},
+                    timeout=8,
+                ).json().get("result", "0x0"), 16) / USDC_DECIMALS
             except Exception:
                 continue
         return 0.0
