@@ -68,7 +68,7 @@ class DataClient:
         settings = get_settings()
         self.base_url = (base_url or settings.data_api_url).rstrip("/")
         self._client = client or httpx.Client(
-            timeout=httpx.Timeout(connect=4.0, read=6.0, write=4.0, pool=4.0),
+            timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
             follow_redirects=True,
         )
         self._lb_cache: tuple[float, list[LeaderboardTrader]] | None = None

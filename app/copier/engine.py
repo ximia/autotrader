@@ -144,7 +144,7 @@ class CopyEngine:
         fills_by_wallet: dict[str, list[SourceTrade]] = {}
         try:
             fills_by_wallet = self.data.global_momentum_scan(
-                limit=200,
+                limit=1000,
                 since_ts=now_ts - int(settings.signal_window_min * 60),
             )
             report.trades_seen = sum(len(v) for v in fills_by_wallet.values())
