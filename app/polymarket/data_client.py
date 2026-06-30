@@ -392,6 +392,61 @@ class DataClient:
 
         return results
 
+    # ── GLOBAL MOMENTUM SCAN ─────────────────────────────────────────────────
+
+    def global_momentum_scan(
+        self,
+        limit: int = 500,
+        since_ts: Optional[int] = None,
+    ) -> dict[str, list[SourceTrade]]:
+        """Fetch the most recent platform-wide trades and group by wallet.
+
+        This scans ALL traders on Polymarket, not just the follow list.
+        Used by the signal engine to detect when many different wallets
+        are piling into the same market — the real momentum signal.
+        """
+        try:
+            params: dict[str, Any] = {"limit": limit, "takerOnly": "true"}
+            data = self._get("/trades", params)
+        except Exception as exc:
+            log.warning("global momentum scan failed: %s", exc)
+            return {}
+
+        rows = data if isinstance(data, list) else data.get("data", [])
+        by_wallet: dict[str, list[SourceTrade]] = {}
+
+        for row in rows:
+            token_id = str(row.get("asset") or "")
+            if not token_id:
+                continue
+            ts = int(row.get("timestamp") or 0)
+            if since_ts and ts <= since_ts:
+                continue
+            price = float(row.get("price") or 0)
+            shares = float(row.get("size") or 0)
+            if price <= 0 or shares <= 0:
+                continue
+            wallet = (row.get("proxyWallet") or "").lower()
+            if not wallet:
+                continue
+
+            trade = SourceTrade(
+                id=f"{row.get('transactionHash') or 'tx'}:{token_id}:{ts}",
+                wallet=wallet,
+                token_id=token_id,
+                condition_id=row.get("conditionId"),
+                side=str(row.get("side", "")).upper() or "BUY",
+                price=price,
+                shares=shares,
+                timestamp=ts,
+                market_question=row.get("title"),
+                outcome=row.get("outcome"),
+            )
+            by_wallet.setdefault(wallet, []).append(trade)
+
+        log.info("global scan: %d trades from %d unique wallets", len(rows), len(by_wallet))
+        return by_wallet
+
     # ── PORTFOLIO VALUE ───────────────────────────────────────────────────────
 
     def portfolio_value(self, user: str) -> float:

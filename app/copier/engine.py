@@ -204,6 +204,21 @@ class CopyEngine:
             }
             self._process_exits(trader_sold, settings)
 
+        # ── global momentum scan ──────────────────────────────────────────────
+        # Scan ALL recent platform trades so we catch any market gaining
+        # momentum — not limited to our 24 tracked wallets.
+        try:
+            global_fills = self.data.global_momentum_scan(
+                limit=500,
+                since_ts=now_ts - int(settings.signal_window_min * 60),
+            )
+            for wallet, fills in global_fills.items():
+                if wallet not in fills_by_wallet:
+                    fills_by_wallet[wallet] = fills
+            log.info("global scan merged: %d total wallets", len(fills_by_wallet))
+        except Exception:
+            log.debug("global scan failed — using follow list only")
+
         # ── consensus signal generation ───────────────────────────────────
         # Filter to BUY fills for signal detection.
         if settings.copy_buys_only:
