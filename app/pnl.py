@@ -63,8 +63,26 @@ def compute_summary() -> PnLSummary:
         realized = sum(p.realized_pnl_usd for p in positions)
         unrealized = positions_value - cost_basis
 
-        # In live mode use the on-chain balance tracked by the engine each cycle.
-        cash = state.usdc_available if settings.live_trading else state.paper_cash_usd
+        # In live mode read the live on-chain pUSD balance directly so the
+        # dashboard always shows the real available amount, not a stale cache.
+        if settings.live_trading:
+            try:
+                from app.polymarket.clob_client import _PUSD, USDC_DECIMALS
+                import httpx
+                wallet = settings.wallet_address
+                data = "0x70a08231" + wallet[2:].zfill(64)
+                r = httpx.post(
+                    "https://polygon-bor-rpc.publicnode.com",
+                    json={"jsonrpc":"2.0","method":"eth_call",
+                          "params":[{"to":_PUSD,"data":data},"latest"],"id":1},
+                    timeout=5,
+                )
+                cash = int(r.json().get("result","0x0"),16) / USDC_DECIMALS
+                state.usdc_available = cash
+            except Exception:
+                cash = state.usdc_available
+        else:
+            cash = state.paper_cash_usd
         bankroll = cash + positions_value
 
         # Win rate over positions that have realised something (closed or trimmed).
