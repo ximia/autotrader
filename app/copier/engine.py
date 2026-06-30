@@ -364,7 +364,32 @@ class CopyEngine:
         )
 
         for d in decisions:
-            result = self.executor.sell(d.token_id, d.shares, d.cur_price)
+            # Check if market already resolved — if so, settle directly without selling.
+            market = self.gamma.market_for_token(d.token_id, use_cache=False)
+            if market and market.closed:
+                mid = market.mid_price
+                final_price = 1.0 if (mid and mid >= 0.95) else 0.0
+                with session_scope() as s:
+                    pos = s.get(Position, d.token_id)
+                    if pos and pos.shares > 0:
+                        proceeds = pos.shares * final_price
+                        pnl = proceeds - pos.cost_basis_usd
+                        pos.realized_pnl_usd += pnl
+                        pos.cost_basis_usd = 0.0
+                        pos.shares = 0.0
+                        pos.closed = True
+                        state = get_state(s)
+                        risk_mgr.record_fill_outcome(pnl >= 0, settings, state)
+                        log.info("market resolved: %s final=%.0f pnl=%.2f",
+                                 d.token_id[:16], final_price, pnl)
+                continue
+
+            try:
+                result = self.executor.sell(d.token_id, d.shares, d.cur_price)
+            except Exception as exc:
+                log.warning("sell failed for %s: %s", d.token_id[:16], exc)
+                continue
+
             with session_scope() as s:
                 pos = s.get(Position, d.token_id)
                 if not pos or pos.shares <= 0:
