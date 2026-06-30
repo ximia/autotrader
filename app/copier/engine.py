@@ -43,6 +43,7 @@ from app.polymarket.gamma_client import GammaClient
 log = logging.getLogger(__name__)
 
 _signal_engine = SignalEngine()
+_dead_tokens: set[str] = set()  # tokens with no CLOB orderbook (404) — skip these
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,6 +163,13 @@ class CopyEngine:
                 if f.side == "SELL"
             }
             self._process_exits(trader_sold, settings)
+
+        # ── filter dead tokens (no CLOB orderbook) ───────────────────────
+        if _dead_tokens:
+            fills_by_wallet = {
+                w: [f for f in fills if f.token_id not in _dead_tokens]
+                for w, fills in fills_by_wallet.items()
+            }
 
         # ── consensus signal generation ───────────────────────────────────
         # Filter to BUY fills for signal detection.
@@ -515,9 +523,12 @@ class CopyEngine:
             result = self.executor.buy(sig.token_id, usd, cur_price)
         except Exception as exc:
             err = str(exc)
-            # "No orderbook" = market not on CLOB; skip silently.
-            reason = f"exec:no_orderbook" if "orderbook" in err.lower() else f"exec:{err[:60]}"
-            self._record_signal(sig, executed=False, skip_reason=reason)
+            if "orderbook" in err.lower() or "404" in err:
+                # Cache dead token so signal engine skips it next cycle.
+                _dead_tokens.add(sig.token_id)
+                self._record_signal(sig, executed=False, skip_reason="no_orderbook")
+            else:
+                self._record_signal(sig, executed=False, skip_reason=f"exec:{err[:60]}")
             report.signals_skipped += 1
             return False
         total_latency_ms = round((time.monotonic() - t0) * 1000, 2)
