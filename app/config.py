@@ -68,8 +68,8 @@ class Settings(BaseSettings):
     signal_cooldown_min: float = Field(default=60.0, ge=0)
 
     # ── position sizing (fractional Kelly) ───────────────────────────────────
-    kelly_fraction: float = Field(default=0.25, gt=0, le=2.0)
-    max_kelly_bet_pct: float = Field(default=0.05, gt=0, le=0.5)
+    kelly_fraction: float = Field(default=0.25, gt=0, le=10.0)
+    max_kelly_bet_pct: float = Field(default=0.05, gt=0, le=1.0)
     # Maximum fraction of bankroll in any single market across all positions.
     max_exposure_per_market_pct: float = Field(default=0.15, gt=0, le=1.0)
     # Maximum fraction of bankroll in positions opened via any single tracked trader.

@@ -37,10 +37,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Maximum assumed edge above market price (fraction).
-# Even at 100% confidence we only claim +8% edge to stay humble.
-_EDGE_SCALE = 0.16   # confidence 0.5→1.0 maps to edge 0→8%
-_EDGE_CAP   = 0.08   # hard cap on estimated edge
+# Confidence → estimated edge mapping.
+# Higher scale means a 0.6-confidence signal (copy-trade consensus) produces
+# a meaningful bet size even with a small bankroll.
+_EDGE_SCALE = 0.60   # confidence 0.5→1.0 maps to edge 0→30%
+_EDGE_CAP   = 0.30   # hard cap on estimated edge
 
 
 @dataclass
@@ -100,13 +101,9 @@ def kelly_size(
     usd = max(usd_capped, 0.0)
 
     if usd < min_order_usd:
-        return KellyResult(
-            0.0, False,
-            f"kelly usd={usd:.2f} below min_order={min_order_usd:.2f}",
-            kelly_f=round(kelly_f, 4),
-            adjusted_f=round(adjusted_f, 4),
-            edge_pct=round(edge_pct, 4),
-        )
+        # Positive-edge signal but bet is below minimum — floor to min_order_usd
+        # so valid signals always place at least the minimum trade.
+        usd = min_order_usd
 
     return KellyResult(
         usd=round(usd, 2),

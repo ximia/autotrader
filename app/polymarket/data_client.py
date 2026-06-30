@@ -401,8 +401,8 @@ class DataClient:
     ) -> dict[str, list[SourceTrade]]:
         """Fetch the most recent platform-wide trades and group by wallet."""
         data = None
-        # Try with increasing limits — start small so fast cycles still work
-        for attempt_limit in [min(limit, 300), min(limit, 500), limit]:
+        # Try largest first, fall back to smaller if it times out.
+        for attempt_limit in [limit, 500, 300]:
             try:
                 params: dict[str, Any] = {"limit": attempt_limit, "takerOnly": "true"}
                 url = f"{self.base_url}/trades"
@@ -410,9 +410,10 @@ class DataClient:
                     resp = c.get(url, params={k: v for k, v in params.items() if v is not None})
                     resp.raise_for_status()
                     data = resp.json()
+                log.info("global scan fetched %d trades (limit=%d)", len(data) if isinstance(data, list) else 0, attempt_limit)
                 break
             except Exception as exc:
-                log.debug("global scan attempt %d failed: %s", attempt_limit, exc)
+                log.debug("global scan attempt limit=%d failed: %s — retrying smaller", attempt_limit, exc)
                 continue
 
         if data is None:
